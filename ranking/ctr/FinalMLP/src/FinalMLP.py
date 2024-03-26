@@ -13,17 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # =========================================================================
+import copy
+import operator
+from functools import reduce
 
+import numpy as np
 import torch
-from torch import nn
-from fuxictr.pytorch.models import BaseModel
 from fuxictr.pytorch.layers import FeatureEmbedding, MLP_Block
+from fuxictr.pytorch.models import BaseModel
+from torch import nn
 
 
 class FinalMLP(BaseModel):
-    def __init__(self, 
-                 feature_map, 
+    def __init__(self,
+                 feature_map,
                  model_id="FinalMLP",
+                 k=1,
                  gpu=-1,
                  learning_rate=1e-3,
                  embedding_dim=10,
@@ -43,44 +48,52 @@ class FinalMLP(BaseModel):
                  embedding_regularizer=None,
                  net_regularizer=None,
                  **kwargs):
-        super(FinalMLP, self).__init__(feature_map, 
-                                       model_id=model_id, 
-                                       gpu=gpu, 
-                                       embedding_regularizer=embedding_regularizer, 
+        super(FinalMLP, self).__init__(feature_map,
+                                       model_id=model_id,
+                                       gpu=gpu,
+                                       embedding_regularizer=embedding_regularizer,
                                        net_regularizer=net_regularizer,
                                        **kwargs)
         self.embedding_layer = FeatureEmbedding(feature_map, embedding_dim)
+        self.k = k
         feature_dim = embedding_dim * feature_map.num_fields
-        self.mlp1 = MLP_Block(input_dim=feature_dim,
-                              output_dim=None, 
-                              hidden_units=mlp1_hidden_units,
-                              hidden_activations=mlp1_hidden_activations,
-                              output_activation=None,
-                              dropout_rates=mlp1_dropout,
-                              batch_norm=mlp1_batch_norm)
-        self.mlp2 = MLP_Block(input_dim=feature_dim,
-                              output_dim=None, 
-                              hidden_units=mlp2_hidden_units,
-                              hidden_activations=mlp2_hidden_activations,
-                              output_activation=None,
-                              dropout_rates=mlp2_dropout, 
-                              batch_norm=mlp2_batch_norm)
+        self.mlps = list()
+        for i in range(k * 2):
+            print(f"init mlp i={i}")
+            hidden_units = mlp2_hidden_units if i % 2 == 1 else mlp1_hidden_units
+            dropout = mlp2_dropout if i % 2 == 1 else mlp1_dropout
+            hidden_activations = mlp2_hidden_activations if i % 2 == 1 else mlp1_hidden_activations
+            batch_norm = mlp2_batch_norm if i % 2 == 1 else mlp1_batch_norm
+            self.mlps.append(
+                MLP_Block(input_dim=feature_dim,
+                          output_dim=None,
+                          hidden_units=hidden_units,
+                          hidden_activations=hidden_activations,
+                          output_activation=None,
+                          dropout_rates=dropout,
+                          batch_norm=batch_norm).to('cuda')
+            )
+            self.mlps = nn.ParameterList(self.mlps)
+            print(f"mlp i={i}= {self.mlps[i]}")
+
         self.use_fs = use_fs
         if self.use_fs:
-            self.fs_module = FeatureSelection(feature_map, 
-                                              feature_dim, 
-                                              embedding_dim, 
-                                              fs_hidden_units, 
+            self.fs_module = FeatureSelection(feature_map,
+                                              feature_dim,
+                                              embedding_dim,
+                                              fs_hidden_units,
                                               fs1_context,
                                               fs2_context)
-        self.fusion_module = InteractionAggregation(mlp1_hidden_units[-1], 
-                                                    mlp2_hidden_units[-1], 
-                                                    output_dim=1, 
+        self.fusion_module = InteractionAggregation(mlp1_hidden_units[-1],
+                                                    mlp2_hidden_units[-1],
+                                                    output_dim=1,
                                                     num_heads=num_heads)
         self.compile(kwargs["optimizer"], kwargs["loss"], learning_rate)
+        params  = list(self.named_parameters())
+        print(f"params={params}")
         self.reset_parameters()
         self.model_to_device()
-            
+
     def forward(self, inputs):
         """
         Inputs: [X,y]
@@ -91,14 +104,30 @@ class FinalMLP(BaseModel):
             feat1, feat2 = self.fs_module(X, flat_emb)
         else:
             feat1, feat2 = flat_emb, flat_emb
-        y_pred = self.fusion_module(self.mlp1(feat1), self.mlp2(feat2))
+
+        y_preds = []
+        # max_index = self.k if self.k % 2 == 0 else self.k - 1
+        for inx in range(0, 2 * self.k, 2):
+            first = self.mlps[inx](feat1)
+            second = self.mlps[inx + 1](feat2)
+            y_preds.append(self.fusion_module(first, second))
+       # y_pred = reduce(lambda x1, x2: torch.mul(x1, x2), y_preds) / self.k
+        stacked_tensor = torch.stack(y_preds)
+        y_pred = torch.mean(stacked_tensor, dim=0)
+        #
+        # y_pred1 = self.fusion_module(self.mlp1(feat1), self.mlp2(feat2))
+        # y_pred2 = self.fusion_module(self.mlp3(feat3), self.mlp4(feat4))
+        # # print(f"y_pred1={y_pred1}")
+        # # print(f"y_pred2={y_pred2}")
+        # # print("--------------------------------")
+        # y_pred = torch.mul(y_pred1, y_pred2)
         y_pred = self.output_activation(y_pred)
         return_dict = {"y_pred": y_pred}
         return return_dict
 
 
 class FeatureSelection(nn.Module):
-    def __init__(self, feature_map, feature_dim, embedding_dim, fs_hidden_units=[], 
+    def __init__(self, feature_map, feature_dim, embedding_dim, fs_hidden_units=[],
                  fs1_context=[], fs2_context=[]):
         super(FeatureSelection, self).__init__()
         self.fs1_context = fs1_context
@@ -153,7 +182,7 @@ class InteractionAggregation(nn.Module):
         self.head_y_dim = y_dim // num_heads
         self.w_x = nn.Linear(x_dim, output_dim)
         self.w_y = nn.Linear(y_dim, output_dim)
-        self.w_xy = nn.Parameter(torch.Tensor(num_heads * self.head_x_dim * self.head_y_dim, 
+        self.w_xy = nn.Parameter(torch.Tensor(num_heads * self.head_x_dim * self.head_y_dim,
                                               output_dim))
         nn.init.xavier_normal_(self.w_xy)
 
@@ -161,7 +190,7 @@ class InteractionAggregation(nn.Module):
         output = self.w_x(x) + self.w_y(y)
         head_x = x.view(-1, self.num_heads, self.head_x_dim)
         head_y = y.view(-1, self.num_heads, self.head_y_dim)
-        xy = torch.matmul(torch.matmul(head_x.unsqueeze(2), 
+        xy = torch.matmul(torch.matmul(head_x.unsqueeze(2),
                                        self.w_xy.view(self.num_heads, self.head_x_dim, -1)) \
                                .view(-1, self.num_heads, self.output_dim, self.head_y_dim),
                           head_y.unsqueeze(-1)).squeeze(-1)
